@@ -20,253 +20,165 @@ from sklearn.linear_model import LinearRegression
 from datetime import datetime, timedelta
 import pandas as pd
 import sys
+from ML.models.action import SimpleArray,SimpleDict,SimpleAny
+import sys
+import os
+import pandas as pd
+import datetime as dt
+import numpy as np
 root_for_data = 'C:\OSTC\Spreads_Data'
 sys.path.insert(1, root_for_data)
 from config_products import tick_price
 
-router = APIRouter(
-)
+router = APIRouter()
+
+@router.post("/get_day_seasonal")
+async def get_spread_time_period_data(dict_input: SimpleDict):
+    print('Begin of get_spread_time_period_data')
+    front_inp = dict_input.array
+    product = front_inp['First']['Product']
+    spread = front_inp['First']['Spread']
+    timeframe = front_inp['First']['Timeframe']
+    last_n_days = front_inp['First']['Last_N_Days']
+    difference = front_inp['First']['Diff']
+
+    data = get_data_from_files(product, spread, last_n_days)
+    data = base_preprocessing_data(data)
+    data = n_minutes_frames(data, timeframe)
+    result = day_seasonality(data, difference)
+    print('End of get_spread_time_period_data')
+    # print(result)
+
+    return result
 
 
-# @router.put("/", response_model= str)
-# async def check_token(
-#     current_user: User = Depends(get_current_user)):
-#     return current_user.email
+def get_data_from_files(product_, spread_, last_n_days=100000):
+    print('Begin of get_data_from_files')
+    path_ = f'{root_for_data}/Tick/{product_}/{spread_}'
+    files = os.listdir(path_)
+    result = pd.DataFrame()
 
-# @router.put("/", response_model= bool)
-# async def write_action(
-#         action: Action,
-#         actions: ActionRepository = Depends(get_action_repository)):
-#     actions.check(action)
-#     return True
+    for file in files[-last_n_days:]:
+        temp = pd.read_csv(f'{path_}/{file}')
+        temp = temp.iloc[::-1]
+        result = pd.concat([result, temp])
 
-
-
-@router.put("/", response_model=Action)
-async def write_action(
-        action: Action,
-        actions: ActionRepository = Depends(get_action_repository)):
-    print(actions)
-
-    return await actions.create(a=action)
+    result.reset_index(drop=True, inplace=True)
+    print('End of get_data_from_files')
+    return result
 
 
-@router.get("/check", response_model=bool)
-async def write_action():
-    return True
+def base_preprocessing_data(df):
+    print('Begin of base_preprocessing_data')
+    df_ = df.copy()
+
+    chosen_columns = ['Datetime', 'Last Price', 'Last Size', 'Bid', 'Ask']
+    df_ = df_[chosen_columns]
+    df_['Side'] = ((df_['Last Price'] == df_['Bid']) + 2 * (df_['Last Price'] == df_['Ask'])).map(
+        {0: 'Gap', 1: 'Sell', 2: 'Buy', 3: 'No Gap'})
+    df_['Datetime'] = pd.to_datetime(df_['Datetime'])
+    print('End of base_preprocessing_data')
+    return df_[['Datetime', 'Last Price', 'Side', 'Last Size']]
+
+def candlestick_combining(df, timeframe, time_anchor= '2023-04-21'):
+    print('Begin of candlestick_combining')
+    current_group = 0
+    current_time = pd.to_datetime(time_anchor)
+    number_of_groups = round(
+        (pd.Timestamp.today() + dt.timedelta(days=1) - current_time) / dt.timedelta(minutes=timeframe) + 1)
+
+    df_ = df.copy()
+    df_['Datetime'] = pd.to_datetime(df_['Datetime'])
+    df_.sort_values(by='Datetime', inplace=True)
+
+    group_table = pd.DataFrame()
+    group_table['Datetime'] = [current_time + dt.timedelta(minutes=timeframe * i) for i in range(number_of_groups)]
+    group_table['Timegroup'] = [i for i in range(number_of_groups)]
+    table_processed = pd.merge_asof(df_, group_table, on='Datetime', direction='forward')
+    table_processed = pd.merge(table_processed, group_table, on="Timegroup")
+    table_processed["Datetime"] = table_processed["Datetime_y"]
+    table_processed.drop(columns=['Datetime_x', 'Datetime_y'], inplace=True)
+
+    table_processed['Buy Last Size'] = (table_processed['Side'] == 'Buy') * table_processed['Last Size']
+    table_processed['Sell Last Size'] = (table_processed['Side'] == 'Sell') * table_processed['Last Size']
+    table_processed['Neutral Last Size'] = ((table_processed['Side'] == 'Gap') + (
+                table_processed['Side'] == 'No Gap')) * table_processed['Last Size']
+
+    def table_group(df):
+        grouped_table = pd.DataFrame()
+        grouped_table['Timegroup'] = np.unique(df['Timegroup'])
+        grouped_table['Datetime'] = np.unique(df['Datetime'])
+
+        grouped_table['Low'] = df.groupby(by="Timegroup", dropna=False).min()['Last Price'].values
+        grouped_table['High'] = df.groupby(by="Timegroup", dropna=False).max()['Last Price'].values
+        grouped_table['Open'] = df.groupby(by="Timegroup", dropna=False).first()['Last Price'].values
+        grouped_table['Close'] = df.groupby(by="Timegroup", dropna=False).last()['Last Price'].values
+        grouped_table['Volume'] = df.groupby(by="Timegroup", dropna=False).sum()['Last Size'].values
+        grouped_table['Buy Volume'] = df.groupby(by="Timegroup", dropna=False).sum()['Buy Last Size'].values
+        grouped_table['Sell Volume'] = df.groupby(by="Timegroup", dropna=False).sum()['Sell Last Size'].values
+        grouped_table['Neutral Volume'] = df.groupby(by="Timegroup", dropna=False).sum()['Neutral Last Size'].values
+        grouped_table.set_index('Datetime', inplace=True)
+
+        return grouped_table
+
+    result = table_group(table_processed)
+    print('End of candlestick_combining')
+    return result
 
 
-def zipfiles(dir, filenames):
-    zip_filename = "archive.zip"
+def n_minutes_frames(df, timeframe):
+    df_ = df.copy()
+    df_.sort_values(by='Datetime', inplace=True)
+    result = pd.DataFrame()
 
-    s = io.BytesIO()
-    zf = zipfile.ZipFile(s, "w")
-    for folderName, subfolders, filenames_ in os.walk(dir):
-        print(f'folderName {folderName}, subfolders {subfolders}, filenames {filenames_}')
-
-        for filename in filenames_:
-            filePath = os.path.join(folderName, filename).replace('\\', '/')
-            # Add file to zip
-            inFolderPath = filePath.replace(dir, '')
-            zf.write(filePath, inFolderPath)
-
-    zf.close()
-    # Grab ZIP file from in-memory, make response with correct MIME-type
-    resp = Response(s.getvalue(), media_type="application/x-zip-compressed", headers={
-        'Content-Disposition': f'attachment;filename={zip_filename}'
-    })
-    return resp
-
-
-@router.get("/getfile")
-async def get_file():
-    entries = os.listdir(DATA_STORAGE_PATH)
-    list_files = [DATA_STORAGE_PATH + i for i in entries]
-    return zipfiles(DATA_STORAGE_PATH, list_files)
+    time_anchor = df_.loc[0, 'Datetime']
+    current_group = 0
+    # current_time = pd.to_datetime(str(time_anchor).split(' ')[0])
+    current_time = pd.to_datetime(pd.to_datetime(time_anchor).date())
+    number_of_groups = round(
+        (pd.Timestamp.today() + dt.timedelta(days=1) - current_time) / dt.timedelta(minutes=timeframe) + 1)
+    result['Datetime'] = [current_time + dt.timedelta(minutes=timeframe * i) for i in range(number_of_groups)]
+    result['Slices'] = result['Datetime']
+    result = pd.merge_asof(df_, result, on='Datetime', direction='forward')
+    result.drop_duplicates(subset=['Slices'], keep='last', inplace=True)
+    result['Datetime'] = result['Slices']
+    result['Close'] = result['Last Price']
+    result.set_index('Datetime', inplace=True)
+    return result[['Close']]
 
 
-@router.put("/downloaddataapi")
-async def download_data_api(nodes: DownloadDataSelected):
-    entries = os.listdir(DATA_STORAGE_PATH)
-    print(nodes)
-    # list_files = [DATA_STORAGE_PATH + i for i in entries]
-    #return zipfiles(DATA_STORAGE_PATH, list_files)
+def day_seasonality(df, diff=False):
+    df_ = df.copy()
 
+    df_['Day'] = df_.index.date
+    df_['Time'] = df_.index.time
+    result = []
+    set_hour = sorted(np.unique(df_['Time']))
+    unique_days = sorted(np.unique(df_['Day']))
+    day_seasonality_table = pd.DataFrame()
+    day_seasonality_table.index = set_hour
+    for u_d in unique_days:
+        day_seasonality_table[u_d] = None
 
-# Function to get instruments, its category and available dates for download
-@router.get("/getassets")
-async def get_assets():
-    def list_files(startpath):
-        print('Get Assets')
-        core_assets = []
-        spec_assets = {}
-        dates = {}
+    for i, row in df_.iterrows():
+        day_seasonality_table.loc[row['Time'], row['Day']] = row['Close']
 
-        for root, dirs, files in os.walk(startpath):
-            level = root.replace(startpath, '').count(os.sep)
-            root_array = root.split('\\')
-            if level == 1:
-                core_assets.append(os.path.basename(root))
-            if level == 2:
-                spec_assets[root_array[-2]] = spec_assets.setdefault(root_array[-2], []) + [os.path.basename(root)]
-            if level == 3:
-                dates[root_array[-2]] = dates.setdefault(root_array[-2], []) + [os.path.basename(root)]
+    if diff:
+        for day in unique_days:
+            first_not_na_price = day_seasonality_table[day].loc[~day_seasonality_table[day].isnull()].iloc[0]
+            day_seasonality_table[day].loc[~day_seasonality_table[day].isnull()] -= first_not_na_price
+            day_seasonality_table[day] = day_seasonality_table[day].astype(float).round(4)
 
-        nodes = []
-        for core_asset in core_assets:
-            core_node = {"key": core_asset, "data": {"name": core_asset}, "children": []}
-            for spec_asset in spec_assets[core_asset]:
-                spec_node = {"key": spec_asset, "data": {}}
-                spec_node['data']['name'] = spec_asset
-                spec_node['data']['min_data'] = min(dates[spec_asset])
-                spec_node['data']['max_data'] = max(dates[spec_asset])
-                core_node['children'].append(spec_node)
-            nodes.append(core_node)
+    # day_seasonality_table['Mean'] = day_seasonality_table.mean(axis = 1)
+    # unique_days.append('Mean')
+    # day_seasonality_table = day_seasonality_table * 100
+    day_seasonality_table = day_seasonality_table.astype(object).replace(np.nan, None)
+    for day in unique_days:
+        dict_day = {}
+        dict_day['name'] = day
+        dict_day['data'] = list(zip(day_seasonality_table.index, day_seasonality_table[day]))
 
-        return nodes
+        dict_day['data'] = [{'x': i[0], 'y': i[1]} for i in dict_day['data']]
+        result.append(dict_day)
 
-    return list_files(DATA_STORAGE_PATH)
-
-
-##Function for only general Name
-# Function to get instruments, its category and available dates for download
-@router.get("/getAssetsNames")
-async def get_assets_names():
-    def list_files(startpath):
-        core_assets = []
-        for root, dirs, files in os.walk(startpath):
-            level = root.replace(startpath, '').count(os.sep)
-            if level == 1:
-                core_assets.append(os.path.basename(root))
-
-        return core_assets
-
-    return list_files(DATA_STORAGE_PATH)
-
-
-##Function for certain spread of asset
-# Function to get instruments, its category and available dates for download
-@router.post("/getSpreadsNames")
-async def get_spreads_names(ch_asset: Chosen_Asset):
-    # chosen_asset = chosen_asset[chosen_asset]
-    print(ch_asset.chosen_asset)
-
-    def list_files(startpath):
-        core_assets = []
-        spec_assets = {}
-        dates = {}
-
-        for root, dirs, files in os.walk(startpath):
-            level = root.replace(startpath, '').count(os.sep)
-            root_array = root.split('\\')
-            if level == 1:
-                core_assets.append(os.path.basename(root))
-            if level == 2:
-                spec_assets[root_array[-2]] = spec_assets.setdefault(root_array[-2], []) + [os.path.basename(root)]
-            if level == 3:
-                dates[root_array[-2]] = dates.setdefault(root_array[-2], []) + [os.path.basename(root)]
-
-        nodes = []
-        for core_asset in core_assets:
-            core_node = {"key": core_asset, "data": {"name": core_asset}, "children": []}
-            for spec_asset in spec_assets[core_asset]:
-                spec_node = {"key": spec_asset, "data": {}}
-                spec_node['data']['name'] = spec_asset
-                spec_node['data']['min_data'] = min(dates[spec_asset])
-                spec_node['data']['max_data'] = max(dates[spec_asset])
-                core_node['children'].append(spec_node)
-            nodes.append(core_node)
-
-        print(spec_assets[ch_asset.chosen_asset])
-        print(type(spec_assets[ch_asset.chosen_asset]))
-        return spec_assets[ch_asset.chosen_asset]
-
-    return list_files(DATA_STORAGE_PATH)
-
-
-# Function to get instruments, its category and available dates for download
-@router.get("/getAssetsSpreadsDates")
-async def get_assets_spreads_dates():
-    def list_files(startpath):
-        core_assets = []
-        spec_assets = {}
-        dates = {}
-
-        for root, dirs, files in os.walk(startpath):
-            level = root.replace(startpath, '').count(os.sep)
-            root_array = root.split('\\')
-            if level == 1:
-                core_assets.append(os.path.basename(root))
-            if level == 2:
-                spec_assets[root_array[-2]] = spec_assets.setdefault(root_array[-2], []) + [os.path.basename(root)]
-            if level == 3:
-                dates[root_array[-2]] = dates.setdefault(root_array[-2], []) + [os.path.basename(root)]
-
-        nodes = []
-        for core_asset in core_assets:
-            core_node = {"key": core_asset, "data": {"name": core_asset}, "children": []}
-            for spec_asset in spec_assets[core_asset]:
-                spec_node = {"key": spec_asset, "data": {}}
-                spec_node['data']['name'] = spec_asset
-                spec_node['data']['min_data'] = min(dates[spec_asset])
-                spec_node['data']['max_data'] = max(dates[spec_asset])
-                core_node['children'].append(spec_node)
-            nodes.append(core_node)
-
-        print(core_assets, spec_assets, dates)
-        return {"assets": core_assets, "spreads": spec_assets, "dates": dates}
-
-    return list_files(DATA_STORAGE_PATH)
-
-@router.get("/getDataPlot")
-async def getDataPlot():
-    first = {'Product': 'BRENT', 'Spread': 'BRENT_23_05-BRENT_23_06'}
-    second = {'Product': 'HEATING OIL', 'Spread': 'HEATING OIL_23_04-HEATING OIL_23_05'}
-
-    def reading_files(path):
-        files = os.listdir(path)
-        concated_data = []
-        for file in files:
-            concated_data.append(pd.read_csv(f'{path}\{file}')[::-1])
-
-        concated_data = pd.concat(concated_data).reset_index(drop=True)
-        return concated_data
-
-    reading_files(f"{root_for_data}\{first['Product']}\{first['Spread']}")
-
-    first_frame = reading_files(f"{root_for_data}\{first['Product']}\{first['Spread']}")
-    second_frame = reading_files(f"{root_for_data}\{second['Product']}\{second['Spread']}")
-
-
-    first_ = first_frame[['datetime', 'open_p']]
-    first_['open_p'] *= tick_price[first['Product']]
-
-    second_ = second_frame[['datetime', 'open_p']]
-    second_['open_p'] *= tick_price[second['Product']]
-
-    first_.rename(columns={'open_p': f'open_first'}, inplace=True)
-    second_.rename(columns={'open_p': f'open_second'}, inplace=True)
-
-    first_['datetime'] = pd.to_datetime(first_['datetime'])
-    second_['datetime'] = pd.to_datetime(second_['datetime'])
-
-    first_.set_index(['datetime'], inplace=True)
-    second_.set_index(['datetime'], inplace=True)
-
-    merged = pd.concat([first_, second_], axis=1, join='outer')
-    merged.fillna(method='ffill', inplace=True)
-
-
-    today = datetime.now()
-    last_n_days = 14
-    slice_day = today - timedelta(days=last_n_days)
-    print(slice_day)
-
-    merged_reduced = merged.copy()
-
-    merged_reduced = merged_reduced.loc[merged_reduced.index > slice_day]
-    reg = LinearRegression().fit(merged_reduced.open_second.values.reshape(-1, 1), merged_reduced.open_first)
-    return {'First': list(merged_reduced.open_first.values[-400:]),
-            'Second':list(merged_reduced.open_second.values[-400:]),
-            'Hedge': list(merged_reduced.open_first.values - merged_reduced.open_second.values * reg.coef_[0])[-400:],
-            "Time":  list(merged_reduced.index.values.astype(str))[-400:]}
+    return result
